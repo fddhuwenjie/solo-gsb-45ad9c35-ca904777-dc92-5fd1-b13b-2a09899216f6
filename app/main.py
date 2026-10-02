@@ -18,6 +18,9 @@ from .engine import (
 )
 from .models import (
     ChainCert,
+    ContinueFailure,
+    ContinueRequest,
+    ContinueSuccess,
     Failure,
     NormalizeErrorDetail,
     NormalizeRequest,
@@ -41,6 +44,7 @@ from .models import (
     VariantSelectionRequest,
     VariantSelectionResult,
 )
+from .continuation import continue_plan
 from .normalize import NormalizeError, normalize_scenario
 from .ocsp import ocsp_precheck
 from .precheck import precheck_identities
@@ -499,6 +503,36 @@ def reconcile_plan(req: ReconcileRequest) -> Any:
     """
     result = reconcile(req)
     if result.status == "conflict":
+        return JSONResponse(status_code=409, content=result.model_dump())
+    return result
+
+
+@app.post(
+    "/plans/continue",
+    response_model=ContinueSuccess,
+    responses={409: {"model": ContinueFailure}},
+    summary="Re-plan a safe continuation after mid-run certificate revocation",
+)
+def continue_plan_route(req: ContinueRequest) -> Any:
+    """Re-plan the remainder of a rotation after a certificate is found
+    revoked while the plan is already executing.
+
+    The executed ``completed_action_ids`` prefix is immutable (never rolled
+    back); the chains actually served right now are taken from
+    ``field_chains``. Every distinct current, target and candidate chain that
+    contains a certificate with fresh revoked evidence, or with simultaneous
+    fresh good and revoked evidence, is eliminated. The remaining actions keep
+    their original allowed_stages; each remaining replace_cert may deploy the
+    cleaned original target chain or one of the (at most 12) clean alternative
+    chains. The returned continuation has the minimum number of stages, keeps
+    every required relationship on a valid trust path after every stage (a
+    remove_trust cannot precede the replacement that retires the chain still
+    anchored at it), and is tie-broken stably by action_id and then by the
+    complete chain fingerprints. When no safe continuation exists, 409 names
+    the first relationship, the blocking certificate and the reason.
+    """
+    result = continue_plan(req)
+    if result.status == "infeasible" or result.status == "invalid":
         return JSONResponse(status_code=409, content=result.model_dump())
     return result
 

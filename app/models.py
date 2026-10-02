@@ -971,6 +971,191 @@ class VariantSelectionErrorDetail(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# /plans/continue: safe continuation after revocation discovered mid-run
+# ---------------------------------------------------------------------------
+
+MAX_CONTINUE_CANDIDATES = 12
+
+
+class ContinueFieldChain(BaseModel):
+    """The chain currently served on an endpoint, observed in the field.
+
+    The completed prefix is immutable, so the observation (not the chain the
+    completed replace_cert action would theoretically serve) is the ground
+    truth the continuation starts from. Endpoints not listed keep the chain
+    implied by the completed prefix.
+    """
+
+    endpoint_id: str = Field(..., min_length=1)
+    chain: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Observed leaf-first chain currently served; must be a "
+                    "well-formed chain ending at a self-signed root.",
+    )
+
+
+class ContinueEndpointAlternatives(BaseModel):
+    """Up to 12 candidate replacement chains offered for one endpoint."""
+
+    endpoint_id: str = Field(..., min_length=1)
+    candidate_chains: list[list[str]] = Field(
+        ...,
+        max_length=MAX_CONTINUE_CANDIDATES,
+        description=f"At most {MAX_CONTINUE_CANDIDATES} leaf-first candidate "
+                    "chains ending at a self-signed root; identical chains "
+                    "are folded together.",
+    )
+
+
+class ContinueRevocationEvidence(BaseModel):
+    """One pre-evaluated, offline revocation evidence item for a certificate.
+
+    The continuation request is expressed in PlanRequest terms (cert_id, no
+    PEM), so the offline OCSP/CRL material is submitted as already-derived
+    evidence: only **fresh** status evidence participates — a fresh ``revoked``
+    item disqualifies every chain containing the certificate, and simultaneous
+    fresh ``good`` and fresh ``revoked`` items for one certificate are an
+    unresolved conflict that disqualifies those chains as well. Stale or
+    missing items do not eliminate anything here (run
+    /deployments/revocation-review to obtain fresh evidence).
+    """
+
+    cert_id: str = Field(..., min_length=1)
+    kind: Literal["ocsp", "crl"] = Field(
+        ...,
+        description="Offline source the verdict was derived from (stapled "
+                    "OCSP response or CRL).",
+    )
+    fresh: bool = Field(
+        ...,
+        description="True only when the evidence is authentic and valid at "
+                    "the review instant (inside its time window). Only fresh "
+                    "items participate in the elimination.",
+    )
+    status: Literal["good", "revoked"] = Field(
+        ...,
+        description="The certificate status asserted by this fresh evidence.",
+    )
+    source_index: Optional[int] = Field(
+        default=None,
+        description="Optional index of the blob in the caller's offline "
+                    "evidence set, carried for audit correlation.",
+    )
+
+
+class ContinueRequest(PlanRequest):
+    """Original PlanRequest plus the mid-run revocation situation.
+
+    The already-executed action prefix can never be rolled back. Alongside it
+    the caller reports the chains observed in the field, up to 12 alternative
+    candidate chains per endpoint, and fresh offline revocation evidence keyed
+    by cert_id.
+    """
+
+    completed_action_ids: list[str] = Field(
+        default_factory=list,
+        description="Actions that have already executed; their effects are "
+                    "an immutable prefix of the continuation.",
+    )
+    field_chains: list[ContinueFieldChain] = Field(
+        default_factory=list,
+        description="Current chains actually observed on endpoints right now.",
+    )
+    alternatives: list[ContinueEndpointAlternatives] = Field(
+        default_factory=list,
+        description="Up to 12 candidate replacement chains per endpoint.",
+    )
+    revocation_evidence: list[ContinueRevocationEvidence] = Field(
+        default_factory=list,
+        description="Fresh offline good/revoked evidence keyed by cert_id.",
+    )
+
+
+class ContinueChainDeployment(BaseModel):
+    """The chain a replace_cert stage actually deploys for one endpoint."""
+
+    endpoint_id: str
+    chain: list[str] = Field(..., description="Selected leaf-first chain.")
+
+
+class ContinueStage(BaseModel):
+    stage: int
+    action_ids: list[str]
+    chain_deployments: list[ContinueChainDeployment] = Field(
+        ...,
+        description="Chains deployed by the replace_cert actions of this "
+                    "stage (sorted by endpoint_id); empty for stages without "
+                    "a replace_cert action.",
+    )
+
+
+class EliminatedChain(BaseModel):
+    """A current/target/candidate chain removed from consideration."""
+
+    endpoint_id: str
+    role: Literal["current", "target", "candidate"]
+    chain: list[str]
+    reason: Literal["certificate_revoked", "conflicting_evidence"]
+    blocking_certificate: str = Field(
+        ...,
+        description="First (leaf-first) non-anchor certificate whose fresh "
+                    "evidence revokes it or is good/revoked conflicting.",
+    )
+
+
+class ContinueSuccess(BaseModel):
+    status: Literal["ok"] = "ok"
+    stage_count: int
+    completed_action_ids: list[str] = Field(
+        ...,
+        description="Echo of the immutable executed prefix, sorted by "
+                    "action_id.",
+    )
+    stages: list[ContinueStage] = Field(
+        ...,
+        description="Minimum-stage continuation, stages numbered from 1 "
+                    "(leading no-op gaps kept as explicit empty stages).",
+    )
+    selected_chains: list[ContinueChainDeployment] = Field(
+        ...,
+        description="Clean chain finally selected for each endpoint whose "
+                    "replace_cert action remains, sorted by endpoint_id.",
+    )
+    eliminated_chains: list[EliminatedChain] = Field(
+        ...,
+        description="Every distinct current/target/candidate chain removed "
+                    "for fresh revoked or conflicting evidence, sorted by "
+                    "(endpoint_id, role, chain).",
+    )
+
+
+class ContinueFailure(BaseModel):
+    status: Literal["infeasible", "invalid"]
+    stage: int = Field(
+        ...,
+        description="Stage that first breaks a relationship; 0 when the "
+                    "executed prefix / field state is already unusable.",
+    )
+    relationship: RelationshipRef
+    blocking_certificate: Optional[str] = Field(
+        ...,
+        description="Certificate blocking the continuation (the revoked "
+                    "cert, the untrusted chain terminator, ...); null only "
+                    "when no specific certificate is responsible.",
+    )
+    blocking_action: Optional[str] = Field(
+        ...,
+        description="Remaining action that first breaks the relationship "
+                    "during the diagnostic replay, or null.",
+    )
+    reason: str
+    chain: list[ChainCert]
+    trusted_anchors: list[str]
+    message: str
+
+
+# ---------------------------------------------------------------------------
 # /deployments/revocation-review: chain-wide offline revocation evidence
 # ---------------------------------------------------------------------------
 

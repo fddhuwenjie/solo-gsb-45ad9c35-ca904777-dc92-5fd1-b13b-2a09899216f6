@@ -22,6 +22,9 @@ OCSP 响应是否由签发者（或其授权响应证书）签名、状态为 go
 间接/增量 CRL 按不支持处理；只有链上每张非信任根证书在同一时刻都有有效且
 一致的 good 证据时端点才 `eligible:true`，新鲜 revoked 优先，good/revoked
 冲突、证据缺失或过期均为不合格，合格链可直接交给规划接口。
+若计划**执行途中**才发现证书被撤销，可用 `/plans/continue` 把已完成动作作为
+不可回退前缀、剔除带新鲜 revoked/冲突证据的现场链与目标链/候选替代链，并为剩余
+动作重算阶段最少、每阶段保持全部通信关系的安全续策。
 
 ## 一键启动
 
@@ -696,6 +699,86 @@ curl -s http://localhost:8080/plans/reconcile \
 
 计划结构错误（阶段不连续、动作缺失/重复/未知、动作排在 `allowed_stages` 之外、
 同阶段矛盾增撤信）或观测引用未知 id 时返回 `422`。
+
+### `POST /plans/continue` — 执行期间发现证书撤销后的安全续策
+
+轮换计划**已经在执行中**，却从离线 OCSP/CRL 证据里发现正在使用的链上证书被
+撤销时，把**原始 PlanRequest**、**已完成的 `completed_action_ids`**、**现场当前
+链**、每端点不超过 **12** 条候选替代链，以及按 `cert_id` 给出的**新鲜离线撤销
+证据**一起提交，服务在**绝不回退已完成前缀**的前提下重算剩余动作的最少阶段
+续策。示例见 [`examples/continue_request.json`](examples/continue_request.json)：
+
+```bash
+curl -s http://localhost:8080/plans/continue \
+  -H 'Content-Type: application/json' \
+  --data @examples/continue_request.json
+```
+
+请求在场景字段之外额外携带：
+
+| 字段 | 说明 |
+| --- | --- |
+| `completed_action_ids` | 已执行动作；其增信/撤信效果构成**不可回退前缀**，续策只安排其余动作 |
+| `field_chains` | 现场实际观测到的端点当前链 `{endpoint_id, chain}`（leaf-first）。未列出的端点沿用「原始当前链 + 已完成 replace_cert」推导出的链；已列出的以观测为准 |
+| `alternatives[].candidate_chains` | 每端点 1..12 条候选替代链（leaf-first、末位为自签名根）；完全相同的链折叠为一条 |
+| `revocation_evidence` | 离线证据的**已判定结论**：`{cert_id, kind(ocsp/crl), fresh, status(good/revoked)}`。仅 `fresh: true` 的条目参与剔除 |
+
+处理规则：
+
+- **剔除脏链**：每条**当前（现场）链、原始目标链、候选替代链**，只要包含带新鲜
+  revoked 证据的非信任根证书即记 `certificate_revoked` 剔除；同一证书同时存在
+  新鲜 good 与新鲜 revoked 证据记 `conflicting_evidence` 剔除。链末信任根不审查；
+  陈旧（`fresh: false`）或缺失证据不剔除（需要 fail-closed 的证据缺失/过期判定，
+  先用 `/deployments/revocation-review`）。
+- **续策模型**：剩余动作保留各自原始 `allowed_stages`（阶段从 1 重新编号，沿用
+  `/plans` 的绝对阶段与显式 no-op 空阶段语义）；剩余的每个 `replace_cert` 可以
+  部署「干净的原目标链」与「干净候选链」中的任意一条。
+- **每阶段后全部关系仍须有有效信任路径**——因此撤信绝不可能排在仍依赖该锚的
+  换证之前，被撤销链也绝不可能被选为目标链（它只是必须立刻被替掉的起点现实）。
+- **阶段数最少**；多解先按各动作所在阶段号的 `action_id` 字典序、再按所部署
+  **完整链指纹**字典序稳定裁决，结果与候选输入顺序无关。
+
+成功返回 `200`：每阶段除 `action_ids` 外给出该阶段换证动作实际部署的
+`chain_deployments`；`selected_chains` 列出每个换证端点最终选定的干净链；
+`eliminated_chains` 审计性列出每一条被剔除的当前/目标/候选链、角色、原因与首个
+阻塞证书（叶在前），按 `(endpoint_id, role, chain)` 稳定排序：
+
+```json
+{
+  "status": "ok",
+  "stage_count": 2,
+  "completed_action_ids": ["a1-add-new-root"],
+  "stages": [
+    {"stage": 1, "action_ids": [], "chain_deployments": []},
+    {"stage": 2,
+     "action_ids": ["a2-serve-new-leaf", "a3-remove-old-root"],
+     "chain_deployments": [
+       {"endpoint_id": "api.example.com", "chain": ["leaf-alt", "root-new"]}
+     ]}
+  ],
+  "selected_chains": [
+    {"endpoint_id": "api.example.com", "chain": ["leaf-alt", "root-new"]}
+  ],
+  "eliminated_chains": [
+    {"endpoint_id": "api.example.com", "role": "current",
+     "chain": ["leaf-old", "root-old"],
+     "reason": "certificate_revoked", "blocking_certificate": "leaf-old"}
+  ]
+}
+```
+
+无可行续策返回 `409`，给出**首个关系**、**阻塞证书** `blocking_certificate`、
+阻塞动作（若由某个剩余动作触发）与机器可读 `reason`：
+
+- `untrusted_root` / `issuer_mismatch`：某阶段（或不可回退的前缀现场，此时
+  `status:"invalid"`、`stage:0`）后信任路径断开；
+- `certificate_revoked` / `conflicting_evidence`：现场仍在服务一条脏链，且已无
+  剩余 `replace_cert` 能把端点换到干净链；
+- `no_clean_destination`：剩余换证动作的原目标链与全部候选链都被剔除。
+
+请求级错误（未知/重复 `completed_action_ids`、现场链或候选链结构非法、证据引用
+未知证书、每端点候选超过 12 条等）返回 `422`。示例可用
+`examples/gen_continue_example.py` 重新生成。
 
 ## 请求模型
 
