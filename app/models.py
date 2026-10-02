@@ -756,6 +756,172 @@ class ReconcileConflict(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# /plans/replan: safe continuation after a mid-plan certificate revocation
+# ---------------------------------------------------------------------------
+
+MAX_REPLAN_CANDIDATES = 12
+
+
+class ReplanLiveChain(BaseModel):
+    """The chain one endpoint is observed to serve right now."""
+
+    endpoint_id: str = Field(..., min_length=1)
+    chain: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Leaf-first chain currently served by this endpoint.",
+    )
+
+
+class ReplanEndpointCandidates(BaseModel):
+    """Replacement chains one endpoint may rotate to."""
+
+    endpoint_id: str = Field(..., min_length=1)
+    candidate_chains: list[list[str]] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_REPLAN_CANDIDATES,
+        description=f"At most {MAX_REPLAN_CANDIDATES} leaf-first candidate "
+                    "chains, each ending at a self-signed root; exact "
+                    "duplicates collapse to one option.",
+    )
+
+
+class ReplanEvidenceItem(BaseModel):
+    """One offline revocation verdict for one certificate.
+
+    Mirrors the per-certificate conclusions of
+    ``/deployments/revocation-review``: ``fresh`` marks evidence that is
+    authentic and inside its validity window at the caller's check instant.
+    Stale, not-yet-valid or unverifiable items must be submitted with
+    ``fresh: false`` (or omitted entirely) and never taint a chain; an
+    ``unknown`` status carries no conclusion either way.
+    """
+
+    cert_id: str = Field(..., min_length=1)
+    status: Literal["good", "revoked", "unknown"]
+    fresh: bool
+
+
+class ReplanRequest(PlanRequest):
+    """The original scenario plus the mid-execution revocation situation."""
+
+    completed_action_ids: list[str] = Field(
+        default_factory=list,
+        description="Actions that have definitely executed. Their effects "
+                    "are non-revertible and are applied to the resumption "
+                    "state before the continuation is planned.",
+    )
+    live_chains: list[ReplanLiveChain] = Field(
+        default_factory=list,
+        description="Currently served chain per endpoint. Endpoints not "
+                    "listed serve the chain implied by the completed prefix "
+                    "(target_chain after a completed replace_cert, otherwise "
+                    "current_chain).",
+    )
+    candidates: list[ReplanEndpointCandidates] = Field(
+        default_factory=list,
+        description="Replacement chains each endpoint may rotate to when "
+                    "its declared target_chain is tainted by revocation "
+                    "evidence.",
+    )
+    revocation_evidence: list[ReplanEvidenceItem] = Field(
+        default_factory=list,
+        description="Offline revocation verdicts per certificate. A "
+                    "certificate is tainted when it has fresh revoked "
+                    "evidence; simultaneous fresh good and fresh revoked "
+                    "evidence is a conflict (and still taints).",
+    )
+
+    @model_validator(mode="after")
+    def _check_unique_entries(self) -> "ReplanRequest":
+        if len(set(self.completed_action_ids)) != len(self.completed_action_ids):
+            raise ValueError(
+                "completed_action_ids must not contain duplicates"
+            )
+        live_eps = [c.endpoint_id for c in self.live_chains]
+        if len(set(live_eps)) != len(live_eps):
+            raise ValueError(
+                "live_chains: each endpoint_id may be reported at most once"
+            )
+        cand_eps = [c.endpoint_id for c in self.candidates]
+        if len(set(cand_eps)) != len(cand_eps):
+            raise ValueError(
+                "candidates: each endpoint_id may appear at most once"
+            )
+        return self
+
+
+class ReplanChainSelection(BaseModel):
+    """The clean chain a pending replace_cert action is re-targeted to."""
+
+    endpoint_id: str
+    action_id: str = Field(
+        ..., description="The replace_cert action this selection fulfills."
+    )
+    chain: list[str] = Field(
+        ..., description="Leaf-first chain the endpoint will serve."
+    )
+
+
+class ReplanExcludedChain(BaseModel):
+    """A current/target/candidate chain filtered out by revocation evidence."""
+
+    endpoint_id: str
+    role: Literal["current", "target", "candidate"]
+    chain: list[str]
+    blocking_certificate: str = Field(
+        ...,
+        description="First certificate of the chain (leaf-first) carrying "
+                    "fresh revoked or conflicting evidence.",
+    )
+    reason: Literal["certificate_revoked", "conflicting_evidence"]
+
+
+class ReplanSuccess(BaseModel):
+    status: Literal["ok"] = "ok"
+    stage_count: int
+    stages: list[PlannedStage]
+    chain_selections: list[ReplanChainSelection] = Field(
+        ...,
+        description="Chosen clean chain for every pending replace_cert "
+                    "action, sorted by endpoint_id.",
+    )
+    excluded_chains: list[ReplanExcludedChain] = Field(
+        ...,
+        description="Every current/target/candidate chain tainted by fresh "
+                    "revocation evidence, sorted by (endpoint_id, chain).",
+    )
+
+
+class ReplanFailure(BaseModel):
+    status: Literal["infeasible", "invalid"]
+    stage: int = Field(
+        ...,
+        description="Continuation stage at which the first relationship is "
+                    "lost; 0 when the resumption state itself is broken or "
+                    "revocation evidence already blocks every continuation.",
+    )
+    relationship: RelationshipRef
+    blocking_action: Optional[str] = Field(
+        ...,
+        description="Action that cannot be placed safely, or null when the "
+                    "block is not attributable to one action.",
+    )
+    blocking_certificate: Optional[str] = Field(
+        ...,
+        description="Certificate responsible for the block: the revoked or "
+                    "conflicting certificate, or the chain certificate at "
+                    "which the trust walk breaks; null for action-level "
+                    "scheduling failures.",
+    )
+    reason: str
+    chain: list[ChainCert]
+    trusted_anchors: list[str]
+    message: str
+
+
+# ---------------------------------------------------------------------------
 # /deployments/variants: minimum heterogeneous-client variant selection
 # ---------------------------------------------------------------------------
 

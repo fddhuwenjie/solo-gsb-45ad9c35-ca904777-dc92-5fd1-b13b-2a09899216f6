@@ -34,6 +34,9 @@ from .models import (
     ReconcileRequest,
     ReconcileResult,
     RelationshipRef,
+    ReplanFailure,
+    ReplanRequest,
+    ReplanSuccess,
     RevocationReviewRequest,
     RevocationReviewResult,
     VariantSelectionErrorDetail,
@@ -45,6 +48,7 @@ from .normalize import NormalizeError, normalize_scenario
 from .ocsp import ocsp_precheck
 from .precheck import precheck_identities
 from .reconcile import reconcile
+from .replan import replan
 from .revocation import revocation_review
 from .variants import VariantSelectionError, select_variants
 
@@ -499,6 +503,41 @@ def reconcile_plan(req: ReconcileRequest) -> Any:
     """
     result = reconcile(req)
     if result.status == "conflict":
+        return JSONResponse(status_code=409, content=result.model_dump())
+    return result
+
+
+@app.post(
+    "/plans/replan",
+    response_model=ReplanSuccess,
+    responses={409: {"model": ReplanFailure}},
+    summary="Re-plan a safe continuation after a mid-rotation revocation",
+)
+def replan_plan(req: ReplanRequest) -> Any:
+    """Recompute a minimum-stage safe continuation when revocation evidence
+    surfaces while the rotation plan is being executed.
+
+    The completed action prefix is non-revertible: its trust effects are
+    applied to the resumption state (a completed replace_cert means the
+    endpoint serves its target_chain). Chains containing a certificate with
+    fresh revoked evidence — or with an unresolved fresh good/revoked
+    conflict — are filtered out: a tainted current chain must be rotated
+    away from, and tainted target/candidate chains are never deployed. Each
+    pending replace_cert is re-targeted to one of the endpoint's clean
+    chains (the declared target_chain plus up to 12 candidates); every other
+    remaining action keeps its declaration. Continuation stages are numbered
+    from 1 and allowed_stages apply to that numbering, with explicit no-op
+    stages for sparse eligibility exactly as in /plans.
+
+    Ties are adjudicated stably: fewest stages, then the per-action stage
+    vector in action_id order, then the chosen chains' complete fingerprints
+    ordered by endpoint. When no continuation exists, 409 names the first
+    relationship that cannot be maintained, the blocking certificate and a
+    machine-readable reason (the resumption state being already broken
+    yields status invalid at stage 0).
+    """
+    result = replan(req)
+    if isinstance(result, ReplanFailure):
         return JSONResponse(status_code=409, content=result.model_dump())
     return result
 

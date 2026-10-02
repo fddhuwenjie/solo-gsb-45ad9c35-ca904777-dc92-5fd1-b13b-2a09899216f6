@@ -6,7 +6,9 @@
 完成后所有通信关系仍存在有效的信任路径（从端点叶子到客户端某个信任锚的完整链）。
 也支持逐阶段回放任意计划，定位首次失效的关系、阻塞动作与断开的证书链。
 部署中断后可用 `/plans/reconcile` 结合部分现场观测枚举所有可能进度并给出
-安全的下一步动作。
+安全的下一步动作。计划**执行期间发现证书被撤销**（或出现 good/revoked
+冲突证据）时，可用 `/plans/replan` 把已完成前缀视为不可回退，结合现场
+当前链与每端点候选替代链的离线撤销证据，重算阶段最少的安全续策。
 另提供**部署身份预检**：在规划前校验目标叶证书的 SAN 是否覆盖端点声明的
 DNS/IP 身份，并沿链累计中间 CA 的名称约束（excluded 优先、permitted 取交集）。
 以及 **OCSP 装订响应离线预检**：不上网、不连响应器，直接校验端点将装订的
@@ -696,6 +698,107 @@ curl -s http://localhost:8080/plans/reconcile \
 
 计划结构错误（阶段不连续、动作缺失/重复/未知、动作排在 `allowed_stages` 之外、
 同阶段矛盾增撤信）或观测引用未知 id 时返回 `422`。
+
+### `POST /plans/replan` — 撤销发现后的安全续策重规划
+
+计划在**执行期间**发现证书被撤销（或出现 good/revoked 冲突证据）时，原计划
+的目标链可能已不再可部署。本接口在**不可回退的已完成前缀**之上重新计算
+阶段最少的安全续策。请求携带原始 PlanRequest、已完成的 `action_ids`、各端点
+**现场当前链**、每端点最多 **12** 条候选替代链，以及每张证书的**离线撤销
+证据**（可直接来自 `/deployments/revocation-review` 的逐证书结论）：
+
+```bash
+curl -s http://localhost:8080/plans/replan \
+  -H 'Content-Type: application/json' \
+  --data @examples/replan_request.json
+```
+
+请求在场景字段之外额外携带：
+
+| 字段 | 说明 |
+| --- | --- |
+| `completed_action_ids` | 已确定执行完成的动作；其效果（增信/撤信/换证）视为不可回退，先应用到恢复点状态再规划。同一信任边的增信与撤信都已完成时按撤信生效后的净状态计算 |
+| `live_chains` | 各端点当前实际提供的链（叶在前）。未上报的端点按已完成前缀推断（已完成换证的端点提供 `target_chain`，否则提供 `current_chain`）；与已完成换证相矛盾的上报返回 422 |
+| `candidates` | 每端点最多 12 条候选替代链（叶在前、自签名根结尾；完全相同的链折叠为同一选项） |
+| `revocation_evidence` | 逐证书离线证据 `{cert_id, status, fresh}`，`status ∈ good / revoked / unknown`；只有 `fresh: true` 的 good/revoked 参与结论，陈旧与 unknown 一律忽略 |
+
+证据与过滤规则：
+
+- 某张证书存在**新鲜 revoked** 证据即被污染；同时存在新鲜 good 与新鲜
+  revoked 为 `conflicting_evidence`（同样污染）。
+- 含污染证书的**当前链**必须被轮换走，**目标链与候选链**永不部署；
+  响应的 `excluded_chains` 按 `(endpoint_id, chain)` 稳定列出每条被剔除的
+  链、链上首个污染证书 `blocking_certificate` 与原因。
+- 每个剩余 `replace_cert` 动作在「`target_chain` ∪ 候选链」的**干净**子集中
+  重新选定部署链，`chain_selections` 给出每个换证动作最终选定的完整链；
+  其余剩余动作按原声明执行。续策阶段**从 1 重新编号**，剩余动作的
+  `allowed_stages` 按续策编号解释；稀疏阶段号同样产生显式 no-op 空阶段
+  （与 `/plans` 一致）。调用方若希望某动作在续策中立即执行，应让它的
+  `allowed_stages` 包含 1。
+
+多解裁决与 `/plans` 同源：先比阶段数，再比按 `action_id` 排序的逐动作阶段
+向量，最后比按端点排序的**完整链指纹**序列，结果与候选提交顺序无关。每个
+阶段结束后所有通信关系仍须保持有效——撤信永远不会排在仍在使用对应锚的
+链之前。信任行为完全等价的候选链（对全部相关客户端命中相同锚集合）只在
+指纹裁决时比较一次，取字典序最小者为代表。
+
+成功返回 `200`（示例见
+[`examples/replan_request.json`](examples/replan_request.json)：原计划
+`a1` 已完成，随后 `leaf-new` 被新鲜撤销、候选 `leaf-alt2` 也被撤销，续策
+把换证动作重定向到干净的 `leaf-alt`；由于 `a2` 声明的 `allowed_stages`
+不含续策第 1 阶段，阶段 1 为显式 no-op）：
+
+```json
+{
+  "status": "ok",
+  "stage_count": 2,
+  "stages": [
+    {"stage": 1, "action_ids": []},
+    {"stage": 2, "action_ids": ["a2-serve-new-leaf", "a3-remove-old-root"]}
+  ],
+  "chain_selections": [
+    {"endpoint_id": "api.example.com", "action_id": "a2-serve-new-leaf",
+     "chain": ["leaf-alt", "root-new"]}
+  ],
+  "excluded_chains": [
+    {"endpoint_id": "api.example.com", "role": "candidate",
+     "chain": ["leaf-alt2", "root-new"],
+     "blocking_certificate": "leaf-alt2", "reason": "certificate_revoked"},
+    {"endpoint_id": "api.example.com", "role": "target",
+     "chain": ["leaf-new", "root-new"],
+     "blocking_certificate": "leaf-new", "reason": "certificate_revoked"}
+  ]
+}
+```
+
+无可行续策返回 `409`：`status: "infeasible"` 并给出**首个无法维持的关系**、
+**阻塞证书** `blocking_certificate`（被新鲜撤销/冲突证据污染的证书，或信任
+游走断开的链上证书）与机器可读 `reason`（`certificate_revoked` /
+`conflicting_evidence` / `untrusted_root` / `issuer_mismatch` /
+`contradictory_actions_same_stage` 等），另附断开的链、客户端当前信任锚
+`trusted_anchors` 与人类可读 `message`；恢复点状态本身已破坏关系时
+`status` 为 `"invalid"`、`stage` 为 0、`blocking_action` 为 `null`：
+
+```json
+{
+  "status": "infeasible",
+  "stage": 0,
+  "relationship": {"client_id": "billing-service", "endpoint_id": "api.example.com"},
+  "blocking_action": "a2-serve-new-leaf",
+  "blocking_certificate": "leaf-new",
+  "reason": "certificate_revoked",
+  "chain": [
+    {"cert_id": "leaf-new", "subject": "CN=api.example.com", "issuer": "CN=New Root CA"},
+    {"cert_id": "root-new", "subject": "CN=New Root CA", "issuer": "CN=New Root CA"}
+  ],
+  "trusted_anchors": ["root-new", "root-old"],
+  "message": "every deployable chain for endpoint 'api.example.com' is tainted: ..."
+}
+```
+
+结构错误返回 `422`：未知或重复的已完成动作、未知端点、候选链超过 12 条、
+空链/成环/签发关系不吻合/未以自签名根结尾的链、证据引用未知证书、现场链
+与已完成换证矛盾等（场景字段本身的校验与 `/plans` 完全相同）。
 
 ## 请求模型
 
